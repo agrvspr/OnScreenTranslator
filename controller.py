@@ -13,8 +13,17 @@ import threading
 import queue
 import time
 
-from model import TranslationModel, LANGUAGE_OPTIONS, capture_region
+from model import TranslationModel, LANGUAGE_OPTIONS, LANGUAGES, capture_region
 from view import TranslatorView, select_region_on_screen
+
+# Internal language key -> friendly name, for status messages when
+# auto-detect resolves a language (reverse of the LANGUAGES keys).
+LANGUAGE_KEY_LABELS = {
+    "korean": "Korean",
+    "chinese_simplified": "Chinese (Simplified)",
+    "chinese_traditional": "Chinese (Traditional)",
+    "japanese": "Japanese",
+}
 
 REFRESH_INTERVAL = 1.5  # seconds between screen captures
 
@@ -52,9 +61,12 @@ class TranslatorController:
             self.view.set_status("Region selection cancelled.")
 
     def handle_language_change(self):
+        # Switching the dropdown (including to/from Auto-detect) resets the
+        # auto-detect lock so the next frame re-resolves from scratch.
+        self.model.reset_memory()
         if self.running:
             lang_name = self.view.get_selected_language()
-            self.view.set_status(f"Switching to {lang_name}... (loading model if needed)")
+            self.view.set_status(f"Switched to {lang_name}.")
 
     def handle_toggle_start(self):
         if not self.running:
@@ -81,28 +93,40 @@ class TranslatorController:
     # Background worker: capture -> extract new paragraphs -> translate
     # ------------------------------------------------------------------
     def _worker_loop(self):
-        last_lang_name = None
-        easyocr_code = translate_code = None
+        # Tracks the last language we reported in the status line, so we
+        # only push a status update when it actually changes (avoids
+        # spamming the status line every frame in auto-detect mode).
+        last_reported_key = None
+        on_loading = lambda msg: self.result_queue.put(("status", msg))
 
         while self.running:
-            lang_name = self.view.get_selected_language()
-            if lang_name != last_lang_name:
-                easyocr_code, translate_code = LANGUAGE_OPTIONS[lang_name]
-                # Loading the reader here (rather than lazily inside the
-                # extract call) lets us surface a "loading model" status
-                # message the first time a language is used.
-                self.model.get_reader(
-                    easyocr_code,
-                    on_loading=lambda msg: self.result_queue.put(("status", msg))
-                )
-                last_lang_name = lang_name
-                self.result_queue.put(("status", f"Running ({lang_name})..."))
+            selected_label = self.view.get_selected_language()
+            selected_key = LANGUAGE_OPTIONS[selected_label]  # real key or "auto"
 
             try:
                 img_np = capture_region(self.region)
-                new_paragraphs = self.model.extract_new_paragraphs(img_np, easyocr_code)
+
+                # Resolve which concrete language to use this frame. In
+                # manual mode this is just the dropdown choice; in auto
+                # mode it detects the script (cached between rechecks).
+                language_key, was_detected = self.model.resolve_language(
+                    img_np, selected_key, on_loading=on_loading
+                )
+
+                # Report the active language when it changes.
+                if language_key != last_reported_key:
+                    label = LANGUAGE_KEY_LABELS.get(language_key, language_key)
+                    if was_detected:
+                        self.result_queue.put(("status", f"Running -- detected {label}."))
+                    else:
+                        self.result_queue.put(("status", f"Running ({label})."))
+                    last_reported_key = language_key
+
+                new_paragraphs = self.model.extract_new_paragraphs(
+                    img_np, language_key, on_loading=on_loading
+                )
                 for para in new_paragraphs:
-                    translated = self.model.translate(para, translate_code)
+                    translated = self.model.translate(para, language_key)
                     self.result_queue.put(("text", translated))
             except Exception as e:
                 self.result_queue.put(("status", f"Error: {e}"))

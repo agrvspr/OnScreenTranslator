@@ -18,11 +18,23 @@ from deep_translator import GoogleTranslator
 
 TARGET_LANG = "en"
 
-# Display name -> (easyocr_code, deep_translator_source_code)
+# Internal language keys -> (easyocr_code, deep_translator_source_code).
+# These are the languages the app can actually OCR + translate.
+LANGUAGES = {
+    "korean": ("ko", "ko"),
+    "chinese_simplified": ("ch_sim", "zh-CN"),
+    "chinese_traditional": ("ch_tra", "zh-TW"),
+    "japanese": ("ja", "ja"),
+}
+
+# What the dropdown shows -> internal key (or "auto" for auto-detect).
+# "Auto-detect" is first so it's the default selection.
 LANGUAGE_OPTIONS = {
-    "Korean": ("ko", "ko"),
-    "Chinese (Simplified)": ("ch_sim", "zh-CN"),
-    "Chinese (Traditional)": ("ch_tra", "zh-TW"),
+    "Auto-detect": "auto",
+    "Korean": "korean",
+    "Chinese (Simplified)": "chinese_simplified",
+    "Chinese (Traditional)": "chinese_traditional",
+    "Japanese": "japanese",
 }
 
 # A vertical gap between two OCR lines bigger than (avg line height * this
@@ -44,6 +56,54 @@ def capture_region(region):
         shot = sct.grab(monitor)
     img = Image.frombytes("RGB", shot.size, shot.rgb)
     return np.array(img)
+
+
+def detect_language_from_text(text):
+    """Guess the source language from a piece of already-OCR'd text by
+    counting characters in script ranges that are UNIQUE to each language.
+
+    The trick: Korean and Japanese each have their own alphabets that
+    Chinese never uses --
+      - Hangul (Korean):    U+AC00-U+D7A3, plus jamo U+1100-U+11FF
+      - Hiragana (Japanese): U+3040-U+309F
+      - Katakana (Japanese): U+30A0-U+30FF
+    Chinese uses only Han/CJK ideographs (U+4E00-U+9FFF), which Korean and
+    Japanese *also* borrow -- so Han characters alone can't distinguish
+    them, but the presence of Hangul or Kana is a dead giveaway.
+
+    Returns one of: "korean", "japanese", "chinese", or None if the text
+    has no CJK content to judge from (e.g. it's all Latin / punctuation).
+
+    Note: returns generic "chinese" -- it can't tell Simplified from
+    Traditional from script alone (they share the same Unicode block).
+    The caller decides which Chinese variant reader to use; we default to
+    Simplified elsewhere, with the dropdown as the manual override.
+    """
+    hangul = hiragana = katakana = han = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF:
+            hangul += 1
+        elif 0x3040 <= cp <= 0x309F:
+            hiragana += 1
+        elif 0x30A0 <= cp <= 0x30FF:
+            katakana += 1
+        elif 0x4E00 <= cp <= 0x9FFF:
+            han += 1
+
+    kana = hiragana + katakana
+
+    # Any Hangul at all -> Korean (Korean text is overwhelmingly Hangul).
+    if hangul > 0 and hangul >= kana:
+        return "korean"
+    # Any Kana at all -> Japanese (Chinese never uses Kana; Korean doesn't
+    # either). Even a little Kana mixed with Han means Japanese.
+    if kana > 0:
+        return "japanese"
+    # Han characters but no Hangul/Kana -> Chinese.
+    if han > 0:
+        return "chinese"
+    return None
 
 
 def group_lines_into_paragraphs(ocr_results):
@@ -106,8 +166,15 @@ class TranslationModel:
         self.translator_cache = {}
         self.seen_paragraphs = OrderedDict()
 
+        # Auto-detect state: the language key we've locked onto, once
+        # detected. Stays locked until reset_memory() is called (e.g. the
+        # user switches the dropdown away and back, or selects a new
+        # region) -- it does not periodically re-check on its own.
+        self._auto_locked_lang = None
+
     def reset_memory(self):
         self.seen_paragraphs.clear()
+        self._auto_locked_lang = None
 
     def get_reader(self, easyocr_code, on_loading=None):
         """Lazily loads and caches an EasyOCR reader for the given language
@@ -129,11 +196,77 @@ class TranslationModel:
             )
         return self.translator_cache[translate_code]
 
-    def extract_new_paragraphs(self, img_np, easyocr_code):
-        """Runs OCR on the image, groups results into paragraphs, and
-        returns only the paragraphs whose content hasn't been seen/returned
-        before (marking them as seen so they won't come back again)."""
-        reader = self.get_reader(easyocr_code)
+    # ------------------------------------------------------------------
+    # Language resolution
+    # ------------------------------------------------------------------
+    def resolve_language(self, img_np, selected_key, on_loading=None):
+        """Decides which concrete language key to use for this frame.
+
+        selected_key is either a real language key (from the dropdown, e.g.
+        "korean") or "auto". For a real key we just return it. For "auto",
+        detection runs once (on the first frame after activation, or after
+        any reset_memory() call) and then stays locked to that result --
+        it will NOT keep re-detecting every frame. To force a fresh
+        detection, switch the dropdown to a manual language and back to
+        Auto-detect (or select a new region), both of which reset the lock.
+
+        Returns (language_key, detected_flag) where detected_flag is True
+        if this was resolved by auto-detection (useful for status display).
+        """
+        if selected_key != "auto":
+            return selected_key, False
+
+        # Already locked onto a language from a previous frame -> keep using it.
+        if self._auto_locked_lang:
+            return self._auto_locked_lang, True
+
+        detected = self._detect_language(img_np, on_loading)
+        if detected:
+            self._auto_locked_lang = detected
+            return detected, True
+
+        # No CJK text found yet (e.g. still loading a page) -- don't lock,
+        # so the next frame tries detection again. Meanwhile fall back to
+        # Korean as an arbitrary default so the pipeline has *a* reader to
+        # use rather than stalling.
+        return "korean", True
+
+    def _detect_language(self, img_np, on_loading=None):
+        """Run one cheap OCR pass with a lightweight reader, read the
+        script, and map it to a concrete language key. Chinese defaults to
+        Simplified (script alone can't tell Simplified from Traditional --
+        the dropdown is the manual override for Traditional)."""
+        # Use whichever reader is already loaded for a cheap first pass;
+        # if none loaded yet, load Korean (arbitrary) to bootstrap. Any
+        # CJK-capable reader detects Hangul/Kana/Han code points fine even
+        # if it's not the "right" language for full recognition.
+        if self.reader_cache:
+            probe_code = next(iter(self.reader_cache))
+        else:
+            probe_code = LANGUAGES["korean"][0]
+        reader = self.get_reader(probe_code, on_loading)
+
+        results = reader.readtext(img_np, detail=0)
+        sample = " ".join(results)
+        script = detect_language_from_text(sample)
+
+        if script == "korean":
+            return "korean"
+        if script == "japanese":
+            return "japanese"
+        if script == "chinese":
+            return "chinese_simplified"
+        return None
+
+    # ------------------------------------------------------------------
+    # Extraction + translation
+    # ------------------------------------------------------------------
+    def extract_new_paragraphs(self, img_np, language_key, on_loading=None):
+        """Runs OCR on the image with the reader for language_key, groups
+        results into paragraphs, and returns only paragraphs whose content
+        hasn't been seen before (marking them seen so they don't repeat)."""
+        easyocr_code, _translate_code = LANGUAGES[language_key]
+        reader = self.get_reader(easyocr_code, on_loading)
         results = reader.readtext(img_np, detail=1)
         paragraphs = group_lines_into_paragraphs(results)
 
@@ -151,7 +284,8 @@ class TranslationModel:
         if len(self.seen_paragraphs) > MAX_SEEN_PARAGRAPHS:
             self.seen_paragraphs.popitem(last=False)  # evict oldest
 
-    def translate(self, text, translate_code):
+    def translate(self, text, language_key):
+        _easyocr_code, translate_code = LANGUAGES[language_key]
         translator = self.get_translator(translate_code)
         try:
             return translator.translate(text)
