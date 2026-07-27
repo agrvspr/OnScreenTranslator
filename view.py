@@ -64,6 +64,74 @@ def select_region_on_screen():
     return coords.get("region")
 
 
+def ask_language_confirmation(detected_label, change_options):
+    """Blocking modal dialog shown when auto-detect identifies a language,
+    asking the user to confirm it or pick a different one instead.
+
+    change_options: dict of {display_name: language_key} for the manual
+    languages the user could switch to (excludes "Auto-detect" itself).
+
+    Returns ("confirm", None) if the user confirms the detected language,
+    or ("change", language_key) if they pick a different one via the
+    dropdown. Closing the dialog (the X button) is treated as "confirm"
+    so it can't get stuck waiting forever.
+    """
+    result = {"action": "confirm", "key": None}
+
+    dialog = tk.Toplevel()
+    dialog.title("Confirm Detected Language")
+    dialog.attributes("-topmost", True)
+    dialog.resizable(False, False)
+    dialog.configure(bg="#1e1e1e")
+    dialog.grab_set()
+
+    tk.Label(
+        dialog, text=f"Detected: {detected_label}", fg="white", bg="#1e1e1e",
+        font=("Segoe UI", 12, "bold"), padx=20, pady=(16, 4)
+    ).pack()
+    tk.Label(
+        dialog, text="Is this correct?", fg="#aaaaaa", bg="#1e1e1e",
+        font=("Segoe UI", 10), padx=20
+    ).pack()
+
+    btn_frame = tk.Frame(dialog, bg="#1e1e1e", padx=20, pady=16)
+    btn_frame.pack()
+
+    def on_confirm():
+        result["action"] = "confirm"
+        dialog.destroy()
+
+    tk.Button(btn_frame, text="Confirm", width=10, command=on_confirm).grid(
+        row=0, column=0, columnspan=2, pady=(0, 10)
+    )
+
+    tk.Label(
+        btn_frame, text="Not right? Change to:", fg="#aaaaaa", bg="#1e1e1e",
+        font=("Segoe UI", 9)
+    ).grid(row=1, column=0, columnspan=2, sticky="w")
+
+    change_var = tk.StringVar(value=next(iter(change_options)))
+    change_dropdown = ttk.Combobox(
+        btn_frame, textvariable=change_var,
+        values=list(change_options.keys()), state="readonly", width=18
+    )
+    change_dropdown.grid(row=2, column=0, pady=(4, 0))
+
+    def on_change():
+        result["action"] = "change"
+        result["key"] = change_options[change_var.get()]
+        dialog.destroy()
+
+    tk.Button(btn_frame, text="Use this", command=on_change).grid(
+        row=2, column=1, padx=(6, 0), pady=(4, 0)
+    )
+
+    dialog.protocol("WM_DELETE_WINDOW", on_confirm)
+    dialog.wait_window()
+
+    return result["action"], result["key"]
+
+
 class TranslatorView:
     """The docked side panel: language dropdown, region/start controls,
     status line, and a scrolling feed of translated paragraphs.
@@ -174,6 +242,9 @@ class TranslatorView:
     def append_translation(self, text):
         self.text_widget.insert("end", text + "\n\n")
         self.text_widget.see("end")
+
+    def clear_translations(self):
+        self.text_widget.delete("1.0", "end")
 
     def set_start_button_enabled(self, enabled):
         self.start_btn.config(state="normal" if enabled else "disabled")

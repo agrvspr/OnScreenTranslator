@@ -1,18 +1,31 @@
 # Screen Translator
 
-Real-time on-screen OCR translator (Korean / Chinese -> English) with a
-docked side-panel UI, split into Model / View / Controller layers.
+Real-time on-screen OCR translator (Korean / Chinese / Japanese ->
+English) with a docked side-panel UI, auto-detect with confirmation,
+split into Model / View / Controller layers.
 
 ## Setup
 
+**Requires Python 3.12 or older** -- PaddleOCR's underlying framework
+(PaddlePaddle) does not yet publish wheels for newer Python versions
+(3.13/3.14). If your system Python is newer, create a virtual
+environment with an older version first, e.g.:
+
 ```
-pip install easyocr mss deep-translator pillow numpy
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+Then, with the venv active:
+
+```
+pip install paddleocr paddlepaddle mss deep-translator pillow numpy
 python main.py
 ```
 
-First run downloads OCR models per language the first time you use them
-(~50-100MB each) and installs PyTorch as a dependency of EasyOCR
-(1-2GB), so the first launch takes a few minutes.
+First run downloads OCR models per language the first time you use them.
+PaddleOCR's models are considerably smaller than the EasyOCR/PyTorch
+combination this project used previously.
 
 ## How to use
 
@@ -21,13 +34,19 @@ First run downloads OCR models per language the first time you use them
    out Korean / Chinese / Japanese on its own, or pick a specific
    language to force it.
 3. Click **Select Region** and drag a rectangle over the foreign text on
-   your screen (a webnovel, e-reader, game, etc).
-4. Click **Start**. Translated paragraphs appear in the feed as new text
-   is detected.
-5. Switch languages any time from the dropdown -- the model reloads the
-   right OCR reader (a few seconds the first time each language is used
-   in a session).
-6. Click **Stop** to pause, **Select Region** again to re-target a
+   your screen (a webnovel, e-reader, game, etc). This also clears any
+   previously translated text in the feed, since a new region means a
+   fresh reading context.
+4. Click **Start**. If Auto-detect is active, a popup will appear the
+   first time it identifies a language ("Detected: Korean -- Is this
+   correct?") -- click **Confirm** to proceed, or pick a different
+   language from the dropdown in the popup and click **Use this** to
+   override it. Translation only begins after this is resolved.
+5. Translated paragraphs appear in the feed as new text is detected.
+6. Switch languages any time from the dropdown -- switching (including
+   back to Auto-detect) resets the lock and will show the confirmation
+   popup again next time a language is resolved.
+7. Click **Stop** to pause, **Select Region** again to re-target a
    different area.
 
 ## How auto-detect works
@@ -42,13 +61,15 @@ characters no other one uses:
 - **Hiragana / Katakana** (あ, ア) -> Japanese
 - **Han/CJK ideographs only, no Hangul or Kana** -> Chinese
 
-Once it locks onto a language it keeps using that one reader until you
-either switch the dropdown away from Auto-detect and back (or pick a
-new language manually), or select a new region -- both reset the lock
-and trigger a fresh detection on the next frame. It does not
-periodically re-check on its own while running, so if the on-screen
-language actually changes mid-session (e.g. you switch tabs to a
-different site), toggle the dropdown to re-trigger detection.
+Once it locks onto a language, it shows a confirmation popup before any
+translation happens with that language. After you confirm (or override),
+it keeps using that reader until you either switch the dropdown away
+from Auto-detect and back (or pick a new language manually), or select a
+new region -- both reset the lock and will show the confirmation popup
+again next time a language is resolved. It does not periodically
+re-check on its own while running, so if the on-screen language actually
+changes mid-session (e.g. you switch tabs to a different site), toggle
+the dropdown to re-trigger detection and confirmation.
 
 Two limitations to know:
 - Script detection can't tell **Simplified from Traditional** Chinese
@@ -97,22 +118,33 @@ main.py        Entry point: creates the Tk root, wires up the
 
 ### Extending each layer
 
-- **New OCR engine (e.g. PaddleOCR):** only `model.py` changes --
-  swap what `TranslationModel.get_reader` returns and how
-  `extract_new_paragraphs` calls it. `view.py` and `controller.py`
-  don't need to know or care.
+- **Swapping OCR engines again:** only `model.py` changes -- specifically
+  `TranslationModel.get_reader` (what loads/returns) and `_run_ocr`
+  (how results get normalized into `(bbox, text, conf)` tuples).
+  `view.py` and `controller.py` don't need to know or care which engine
+  is behind it.
 - **New translation engine (e.g. DeepL, Papago):** only
   `TranslationModel.get_translator` / `translate` change.
 - **New UI (e.g. per-paragraph floating overlays instead of a feed):**
   only `view.py` changes, plus a small tweak in `controller.py` to call
   a different view method when pushing translated text (e.g.
   `view.show_overlay_at(bbox, text)` instead of `append_translation`).
-- **Auto language detection:** would live mostly in `model.py` (run two
-  readers, compare confidence) with a small controller change to stop
-  relying on the view's language dropdown as the source of truth.
+- **Auto-detect + confirmation state machine** lives in
+  `TranslationModel` (`resolve_language`, `confirm_auto_lock`,
+  `override_auto_lock`); the popup itself is
+  `view.ask_language_confirmation`; the thread coordination (pausing the
+  worker until the dialog resolves) is in `controller._worker_loop` /
+  `controller._show_language_confirmation`, using
+  `controller.confirmation_event`.
 
 ## Known limitations
 
+- **Requires Python 3.12 or older** (see Setup). If PaddleOCR's `predict()`
+  result format doesn't match what `model._run_ocr` / `_get_result_field`
+  expect (the API has changed across PaddleOCR versions), you may see an
+  error mentioning `rec_texts`/`rec_polys`/`rec_scores` -- check the exact
+  installed `paddleocr` version's docs and adjust the key names in
+  `model._run_ocr` if needed.
 - Paragraph grouping is a vertical-gap heuristic
   (`model.PARAGRAPH_GAP_MULTIPLIER`) -- tune it if paragraphs are
   merging together (lower it) or splitting apart (raise it) for a

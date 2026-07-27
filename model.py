@@ -6,6 +6,11 @@ grouping detected lines into paragraphs, deduping against previously-seen
 paragraphs, and calling the translation API. Nothing in this file touches
 Tkinter or any UI code, which means all of it is testable by feeding in
 a numpy image array or a plain string -- no window needs to be open.
+
+OCR engine: PaddleOCR (PP-OCRv5). Note this requires Python 3.12 or older
+-- PaddlePaddle does not yet publish wheels for newer Python versions, so
+this must run in a dedicated virtual environment if your system Python is
+newer (e.g. 3.13/3.14). See README.md for venv setup instructions.
 """
 
 import hashlib
@@ -18,13 +23,13 @@ from deep_translator import GoogleTranslator
 
 TARGET_LANG = "en"
 
-# Internal language keys -> (easyocr_code, deep_translator_source_code).
+# Internal language keys -> (paddleocr_lang_code, deep_translator_source_code).
 # These are the languages the app can actually OCR + translate.
 LANGUAGES = {
-    "korean": ("ko", "ko"),
-    "chinese_simplified": ("ch_sim", "zh-CN"),
-    "chinese_traditional": ("ch_tra", "zh-TW"),
-    "japanese": ("ja", "ja"),
+    "korean": ("korean", "ko"),
+    "chinese_simplified": ("ch", "zh-CN"),
+    "chinese_traditional": ("chinese_cht", "zh-TW"),
+    "japanese": ("japan", "ja"),
 }
 
 # What the dropdown shows -> internal key (or "auto" for auto-detect).
@@ -56,6 +61,40 @@ def capture_region(region):
         shot = sct.grab(monitor)
     img = Image.frombytes("RGB", shot.size, shot.rgb)
     return np.array(img)
+
+
+def _run_ocr(reader, img_np):
+    """Runs a PaddleOCR reader on an RGB numpy image and returns a list of
+    (bbox, text, confidence) tuples -- the same shape the old EasyOCR
+    detail=1 output used, so group_lines_into_paragraphs doesn't need to
+    know or care which OCR engine produced it.
+
+    PaddleOCR 3.x's predict() returns one result object per input image
+    (a dict-like object) with 'rec_texts', 'rec_scores', and 'rec_polys'
+    keys holding parallel lists/arrays for each detected text region.
+    """
+    # PaddleOCR expects BGR channel order (like cv2.imread), but our
+    # captured screenshot is RGB (via PIL) -- flip the channel order.
+    img_bgr = img_np[:, :, ::-1]
+
+    common = []
+    for res in reader.predict(img_bgr):
+        texts = _get_result_field(res, "rec_texts")
+        scores = _get_result_field(res, "rec_scores")
+        polys = _get_result_field(res, "rec_polys")
+        for bbox, text, score in zip(polys, texts, scores):
+            common.append((bbox, text, score))
+    return common
+
+
+def _get_result_field(res, key):
+    """Defensive accessor for PaddleOCR result objects: tries dict-style
+    access first (['key']), falls back to attribute access (.key) since
+    the exact result object type has changed across PaddleOCR versions."""
+    try:
+        return res[key]
+    except (TypeError, KeyError, IndexError):
+        return getattr(res, key, [])
 
 
 def detect_language_from_text(text):
@@ -107,8 +146,8 @@ def detect_language_from_text(text):
 
 
 def group_lines_into_paragraphs(ocr_results):
-    """ocr_results: list of (bbox, text, confidence) from
-    easyocr.Reader.readtext(..., detail=1).
+    """ocr_results: list of (bbox, text, confidence) tuples -- the common
+    shape produced by _run_ocr() regardless of which OCR engine is behind it.
 
     Sorts detected lines top-to-bottom, then splits them into paragraphs
     wherever the vertical gap between consecutive lines is unusually large,
@@ -167,27 +206,49 @@ class TranslationModel:
         self.seen_paragraphs = OrderedDict()
 
         # Auto-detect state: the language key we've locked onto, once
-        # detected. Stays locked until reset_memory() is called (e.g. the
+        # detected, and whether the user has confirmed it via the popup.
+        # Stays locked/confirmed until reset_memory() is called (e.g. the
         # user switches the dropdown away and back, or selects a new
         # region) -- it does not periodically re-check on its own.
         self._auto_locked_lang = None
+        self._auto_lock_confirmed = False
 
     def reset_memory(self):
         self.seen_paragraphs.clear()
         self._auto_locked_lang = None
+        self._auto_lock_confirmed = False
 
-    def get_reader(self, easyocr_code, on_loading=None):
-        """Lazily loads and caches an EasyOCR reader for the given language
+    def confirm_auto_lock(self):
+        """Called by the controller once the user confirms (or overrides)
+        the auto-detected language via the confirmation popup."""
+        self._auto_lock_confirmed = True
+
+    def override_auto_lock(self, language_key):
+        """Called by the controller when the user picks a different
+        language than what was auto-detected, via the confirmation popup."""
+        self._auto_locked_lang = language_key
+        self._auto_lock_confirmed = True
+
+    def get_reader(self, ocr_lang_code, on_loading=None):
+        """Lazily loads and caches a PaddleOCR reader for the given language
         code. on_loading, if given, is called with a status string right
-        before a new model starts downloading/loading (first use only)."""
-        if easyocr_code not in self.reader_cache:
+        before a new model starts downloading/loading (first use only).
+
+        Document-scan features (orientation classification, unwarping,
+        text-line angle correction) are disabled since we're reading
+        screenshots of flat digital text, not photographed paper -- this
+        keeps each frame faster without losing meaningful accuracy here."""
+        if ocr_lang_code not in self.reader_cache:
             if on_loading:
-                on_loading(f"Loading {easyocr_code} OCR model...")
-            import easyocr  # imported lazily -- slow import, only pay for it once needed
-            self.reader_cache[easyocr_code] = easyocr.Reader(
-                [easyocr_code, "en"], gpu=False
+                on_loading(f"Loading {ocr_lang_code} OCR model...")
+            from paddleocr import PaddleOCR  # imported lazily -- slow import
+            self.reader_cache[ocr_lang_code] = PaddleOCR(
+                lang=ocr_lang_code,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
             )
-        return self.reader_cache[easyocr_code]
+        return self.reader_cache[ocr_lang_code]
 
     def get_translator(self, translate_code):
         if translate_code not in self.translator_cache:
@@ -203,33 +264,46 @@ class TranslationModel:
         """Decides which concrete language key to use for this frame.
 
         selected_key is either a real language key (from the dropdown, e.g.
-        "korean") or "auto". For a real key we just return it. For "auto",
-        detection runs once (on the first frame after activation, or after
-        any reset_memory() call) and then stays locked to that result --
-        it will NOT keep re-detecting every frame. To force a fresh
-        detection, switch the dropdown to a manual language and back to
-        Auto-detect (or select a new region), both of which reset the lock.
+        "korean") or "auto". For a real key we just return it -- no
+        confirmation needed since the user picked it explicitly. For
+        "auto", detection runs once (on the first frame after activation,
+        or after any reset_memory() call); the result then needs the user
+        to confirm it via a popup (see controller) before it's used for
+        real translation. Once confirmed it stays locked -- it will NOT
+        keep re-detecting or re-confirming every frame.
 
-        Returns (language_key, detected_flag) where detected_flag is True
-        if this was resolved by auto-detection (useful for status display).
+        Returns (language_key, is_auto, needs_confirmation):
+          - is_auto: True if this was resolved via auto-detect (for status
+            display), False if the user picked a language manually.
+          - needs_confirmation: True if this language was just detected
+            and is awaiting user confirmation -- the caller should show
+            the confirmation popup and NOT proceed with extraction/
+            translation until it's confirmed.
         """
         if selected_key != "auto":
-            return selected_key, False
+            return selected_key, False, False
 
-        # Already locked onto a language from a previous frame -> keep using it.
-        if self._auto_locked_lang:
-            return self._auto_locked_lang, True
+        # Locked and already confirmed by the user -> just use it.
+        if self._auto_locked_lang and self._auto_lock_confirmed:
+            return self._auto_locked_lang, True, False
+
+        # Locked but still waiting on user confirmation (popup already
+        # shown, or about to be) -- keep reporting it as pending.
+        if self._auto_locked_lang and not self._auto_lock_confirmed:
+            return self._auto_locked_lang, True, True
 
         detected = self._detect_language(img_np, on_loading)
         if detected:
             self._auto_locked_lang = detected
-            return detected, True
+            self._auto_lock_confirmed = False
+            return detected, True, True
 
         # No CJK text found yet (e.g. still loading a page) -- don't lock,
         # so the next frame tries detection again. Meanwhile fall back to
         # Korean as an arbitrary default so the pipeline has *a* reader to
-        # use rather than stalling.
-        return "korean", True
+        # use rather than stalling. No confirmation needed for a fallback
+        # that isn't a real detection result.
+        return "korean", True, False
 
     def _detect_language(self, img_np, on_loading=None):
         """Run one cheap OCR pass with a lightweight reader, read the
@@ -246,8 +320,8 @@ class TranslationModel:
             probe_code = LANGUAGES["korean"][0]
         reader = self.get_reader(probe_code, on_loading)
 
-        results = reader.readtext(img_np, detail=0)
-        sample = " ".join(results)
+        results = _run_ocr(reader, img_np)
+        sample = " ".join(text for _, text, _ in results)
         script = detect_language_from_text(sample)
 
         if script == "korean":
@@ -265,9 +339,9 @@ class TranslationModel:
         """Runs OCR on the image with the reader for language_key, groups
         results into paragraphs, and returns only paragraphs whose content
         hasn't been seen before (marking them seen so they don't repeat)."""
-        easyocr_code, _translate_code = LANGUAGES[language_key]
-        reader = self.get_reader(easyocr_code, on_loading)
-        results = reader.readtext(img_np, detail=1)
+        ocr_lang_code, _translate_code = LANGUAGES[language_key]
+        reader = self.get_reader(ocr_lang_code, on_loading)
+        results = _run_ocr(reader, img_np)
         paragraphs = group_lines_into_paragraphs(results)
 
         new_paragraphs = []
@@ -285,7 +359,7 @@ class TranslationModel:
             self.seen_paragraphs.popitem(last=False)  # evict oldest
 
     def translate(self, text, language_key):
-        _easyocr_code, translate_code = LANGUAGES[language_key]
+        _ocr_lang_code, translate_code = LANGUAGES[language_key]
         translator = self.get_translator(translate_code)
         try:
             return translator.translate(text)
