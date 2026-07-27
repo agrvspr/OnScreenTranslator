@@ -14,7 +14,7 @@ import queue
 import time
 
 from model import TranslationModel, LANGUAGE_OPTIONS, LANGUAGES, capture_region
-from view import TranslatorView, select_region_on_screen, ask_language_confirmation
+from view import TranslatorView, select_region_on_screen
 
 # Internal language key -> friendly name, for status messages when
 # auto-detect resolves a language (reverse of the LANGUAGES keys).
@@ -23,12 +23,6 @@ LANGUAGE_KEY_LABELS = {
     "chinese_simplified": "Chinese (Simplified)",
     "chinese_traditional": "Chinese (Traditional)",
     "japanese": "Japanese",
-}
-
-# The manual language choices offered in the confirmation popup's "change
-# to" dropdown -- every real language, i.e. everything except "Auto-detect".
-MANUAL_LANGUAGE_CHOICES = {
-    name: key for name, key in LANGUAGE_OPTIONS.items() if key != "auto"
 }
 
 REFRESH_INTERVAL = 1.5  # seconds between screen captures
@@ -47,11 +41,6 @@ class TranslatorController:
         self.running = False
         self.worker_thread = None
         self.result_queue = queue.Queue()
-
-        # Signals the worker thread when a pending language confirmation
-        # dialog has been resolved (confirmed or changed), so it can stop
-        # waiting and continue processing frames.
-        self.confirmation_event = threading.Event()
 
         root.after(150, self._poll_queue)
 
@@ -98,7 +87,6 @@ class TranslatorController:
 
     def _stop(self):
         self.running = False
-        self.confirmation_event.set()  # release worker if it's waiting on a dialog
         self.view.set_running_ui_state(False)
         self.view.set_status("Stopped.")
 
@@ -121,22 +109,10 @@ class TranslatorController:
 
                 # Resolve which concrete language to use this frame. In
                 # manual mode this is just the dropdown choice; in auto
-                # mode it detects the script (cached once confirmed).
-                language_key, was_auto, needs_confirmation = self.model.resolve_language(
+                # mode it detects the script once and stays locked to it.
+                language_key, was_auto = self.model.resolve_language(
                     img_np, selected_key, on_loading=on_loading
                 )
-
-                if needs_confirmation:
-                    # Ask the main thread to show the confirmation popup,
-                    # then block here until the user responds -- don't
-                    # extract/translate this frame (or any frame) until
-                    # the detected language is confirmed or overridden.
-                    self.confirmation_event.clear()
-                    self.result_queue.put(("confirm_language", language_key))
-                    self.confirmation_event.wait()
-                    if not self.running:
-                        break
-                    continue  # re-resolve now that confirmation is settled
 
                 # Report the active language when it changes.
                 if language_key != last_reported_key:
@@ -169,21 +145,6 @@ class TranslatorController:
                     self.view.append_translation(payload)
                 elif kind == "status":
                     self.view.set_status(payload)
-                elif kind == "confirm_language":
-                    self._show_language_confirmation(payload)
         except queue.Empty:
             pass
         self.view.root.after(150, self._poll_queue)
-
-    def _show_language_confirmation(self, detected_key):
-        """Shows the blocking confirmation dialog (main thread only), then
-        signals the worker thread to resume based on the user's choice."""
-        label = LANGUAGE_KEY_LABELS.get(detected_key, detected_key)
-        action, chosen_key = ask_language_confirmation(label, MANUAL_LANGUAGE_CHOICES)
-
-        if action == "confirm":
-            self.model.confirm_auto_lock()
-        else:
-            self.model.override_auto_lock(chosen_key)
-
-        self.confirmation_event.set()

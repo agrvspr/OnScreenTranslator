@@ -206,28 +206,14 @@ class TranslationModel:
         self.seen_paragraphs = OrderedDict()
 
         # Auto-detect state: the language key we've locked onto, once
-        # detected, and whether the user has confirmed it via the popup.
-        # Stays locked/confirmed until reset_memory() is called (e.g. the
+        # detected. Stays locked until reset_memory() is called (e.g. the
         # user switches the dropdown away and back, or selects a new
         # region) -- it does not periodically re-check on its own.
         self._auto_locked_lang = None
-        self._auto_lock_confirmed = False
 
     def reset_memory(self):
         self.seen_paragraphs.clear()
         self._auto_locked_lang = None
-        self._auto_lock_confirmed = False
-
-    def confirm_auto_lock(self):
-        """Called by the controller once the user confirms (or overrides)
-        the auto-detected language via the confirmation popup."""
-        self._auto_lock_confirmed = True
-
-    def override_auto_lock(self, language_key):
-        """Called by the controller when the user picks a different
-        language than what was auto-detected, via the confirmation popup."""
-        self._auto_locked_lang = language_key
-        self._auto_lock_confirmed = True
 
     def get_reader(self, ocr_lang_code, on_loading=None):
         """Lazily loads and caches a PaddleOCR reader for the given language
@@ -237,7 +223,14 @@ class TranslationModel:
         Document-scan features (orientation classification, unwarping,
         text-line angle correction) are disabled since we're reading
         screenshots of flat digital text, not photographed paper -- this
-        keeps each frame faster without losing meaningful accuracy here."""
+        keeps each frame faster without losing meaningful accuracy here.
+
+        enable_mkldnn=True works fine as long as paddlepaddle is pinned to
+        a version before the 3.3.x PIR/oneDNN regression (see README) --
+        if you're on an affected version and hit a
+        "ConvertPirAttribute2RuntimeAttribute" crash, either downgrade
+        paddlepaddle (recommended, keeps full CPU speed) or set this to
+        False as a fallback (works, but noticeably slower/more memory)."""
         if ocr_lang_code not in self.reader_cache:
             if on_loading:
                 on_loading(f"Loading {ocr_lang_code} OCR model...")
@@ -264,46 +257,34 @@ class TranslationModel:
         """Decides which concrete language key to use for this frame.
 
         selected_key is either a real language key (from the dropdown, e.g.
-        "korean") or "auto". For a real key we just return it -- no
-        confirmation needed since the user picked it explicitly. For
-        "auto", detection runs once (on the first frame after activation,
-        or after any reset_memory() call); the result then needs the user
-        to confirm it via a popup (see controller) before it's used for
-        real translation. Once confirmed it stays locked -- it will NOT
-        keep re-detecting or re-confirming every frame.
+        "korean") or "auto". For a real key we just return it. For "auto",
+        detection runs once (on the first frame after activation, or after
+        any reset_memory() call) and then stays locked to that result --
+        it will NOT keep re-detecting every frame. To force a fresh
+        detection, switch the dropdown to a manual language and back to
+        Auto-detect (or select a new region), both of which reset the lock.
 
-        Returns (language_key, is_auto, needs_confirmation):
-          - is_auto: True if this was resolved via auto-detect (for status
-            display), False if the user picked a language manually.
-          - needs_confirmation: True if this language was just detected
-            and is awaiting user confirmation -- the caller should show
-            the confirmation popup and NOT proceed with extraction/
-            translation until it's confirmed.
+        Returns (language_key, is_auto) where is_auto is True if this was
+        resolved via auto-detect (for status display), False if the user
+        picked a language manually.
         """
         if selected_key != "auto":
-            return selected_key, False, False
+            return selected_key, False
 
-        # Locked and already confirmed by the user -> just use it.
-        if self._auto_locked_lang and self._auto_lock_confirmed:
-            return self._auto_locked_lang, True, False
-
-        # Locked but still waiting on user confirmation (popup already
-        # shown, or about to be) -- keep reporting it as pending.
-        if self._auto_locked_lang and not self._auto_lock_confirmed:
-            return self._auto_locked_lang, True, True
+        # Already locked onto a language from a previous frame -> keep using it.
+        if self._auto_locked_lang:
+            return self._auto_locked_lang, True
 
         detected = self._detect_language(img_np, on_loading)
         if detected:
             self._auto_locked_lang = detected
-            self._auto_lock_confirmed = False
-            return detected, True, True
+            return detected, True
 
         # No CJK text found yet (e.g. still loading a page) -- don't lock,
         # so the next frame tries detection again. Meanwhile fall back to
         # Korean as an arbitrary default so the pipeline has *a* reader to
-        # use rather than stalling. No confirmation needed for a fallback
-        # that isn't a real detection result.
-        return "korean", True, False
+        # use rather than stalling.
+        return "korean", True
 
     def _detect_language(self, img_np, on_loading=None):
         """Run one cheap OCR pass with a lightweight reader, read the

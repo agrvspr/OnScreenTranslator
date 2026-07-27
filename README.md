@@ -1,8 +1,8 @@
 # Screen Translator
 
 Real-time on-screen OCR translator (Korean / Chinese / Japanese ->
-English) with a docked side-panel UI, auto-detect with confirmation,
-split into Model / View / Controller layers.
+English) with a docked side-panel UI and language auto-detect, split
+into Model / View / Controller layers.
 
 ## Setup
 
@@ -19,8 +19,17 @@ py -3.12 -m venv venv
 Then, with the venv active:
 
 ```
-pip install paddleocr paddlepaddle mss deep-translator pillow numpy
+pip install paddleocr paddlepaddle==3.2.0 mss deep-translator pillow numpy
 python main.py
+```
+
+**Note the pinned `paddlepaddle==3.2.0`** -- newer 3.3.x releases have a
+known CPU inference bug (see Known Limitations below); 3.2.0 avoids it
+and runs noticeably faster. If you already installed a newer version,
+downgrade with:
+```
+pip uninstall paddlepaddle -y
+pip install paddlepaddle==3.2.0
 ```
 
 First run downloads OCR models per language the first time you use them.
@@ -37,16 +46,11 @@ combination this project used previously.
    your screen (a webnovel, e-reader, game, etc). This also clears any
    previously translated text in the feed, since a new region means a
    fresh reading context.
-4. Click **Start**. If Auto-detect is active, a popup will appear the
-   first time it identifies a language ("Detected: Korean -- Is this
-   correct?") -- click **Confirm** to proceed, or pick a different
-   language from the dropdown in the popup and click **Use this** to
-   override it. Translation only begins after this is resolved.
-5. Translated paragraphs appear in the feed as new text is detected.
-6. Switch languages any time from the dropdown -- switching (including
-   back to Auto-detect) resets the lock and will show the confirmation
-   popup again next time a language is resolved.
-7. Click **Stop** to pause, **Select Region** again to re-target a
+4. Click **Start**. Translated paragraphs appear in the feed as new text
+   is detected.
+5. Switch languages any time from the dropdown -- switching (including
+   back to Auto-detect) resets the lock and triggers a fresh detection.
+6. Click **Stop** to pause, **Select Region** again to re-target a
    different area.
 
 ## How auto-detect works
@@ -61,15 +65,13 @@ characters no other one uses:
 - **Hiragana / Katakana** (あ, ア) -> Japanese
 - **Han/CJK ideographs only, no Hangul or Kana** -> Chinese
 
-Once it locks onto a language, it shows a confirmation popup before any
-translation happens with that language. After you confirm (or override),
-it keeps using that reader until you either switch the dropdown away
-from Auto-detect and back (or pick a new language manually), or select a
-new region -- both reset the lock and will show the confirmation popup
-again next time a language is resolved. It does not periodically
-re-check on its own while running, so if the on-screen language actually
-changes mid-session (e.g. you switch tabs to a different site), toggle
-the dropdown to re-trigger detection and confirmation.
+Once it locks onto a language it keeps using that one reader until you
+either switch the dropdown away from Auto-detect and back (or pick a
+new language manually), or select a new region -- both reset the lock
+and trigger a fresh detection on the next frame. It does not
+periodically re-check on its own while running, so if the on-screen
+language actually changes mid-session (e.g. you switch tabs to a
+different site), toggle the dropdown to re-trigger detection.
 
 Two limitations to know:
 - Script detection can't tell **Simplified from Traditional** Chinese
@@ -129,13 +131,6 @@ main.py        Entry point: creates the Tk root, wires up the
   only `view.py` changes, plus a small tweak in `controller.py` to call
   a different view method when pushing translated text (e.g.
   `view.show_overlay_at(bbox, text)` instead of `append_translation`).
-- **Auto-detect + confirmation state machine** lives in
-  `TranslationModel` (`resolve_language`, `confirm_auto_lock`,
-  `override_auto_lock`); the popup itself is
-  `view.ask_language_confirmation`; the thread coordination (pausing the
-  worker until the dialog resolves) is in `controller._worker_loop` /
-  `controller._show_language_confirmation`, using
-  `controller.confirmation_event`.
 
 ## Known limitations
 
@@ -145,6 +140,15 @@ main.py        Entry point: creates the Tk root, wires up the
   error mentioning `rec_texts`/`rec_polys`/`rec_scores` -- check the exact
   installed `paddleocr` version's docs and adjust the key names in
   `model._run_ocr` if needed.
+- **PaddlePaddle 3.3.x CPU/oneDNN bug**: newer PaddlePaddle 3.3.x releases
+  have a regression where CPU inference with oneDNN (the default) crashes
+  with `NotImplementedError: ConvertPirAttribute2RuntimeAttribute not
+  support [pir::ArrayAttribute<pir::DoubleAttribute>]`. This worked fine
+  in 3.2.x. **Fix: pin `paddlepaddle==3.2.0`** (see Setup) rather than
+  disabling oneDNN on a newer version -- disabling oneDNN as a fallback
+  works but is noticeably slower and can use significantly more memory
+  during inference. Revisit this pin once a PaddlePaddle release fixes
+  the regression.
 - Paragraph grouping is a vertical-gap heuristic
   (`model.PARAGRAPH_GAP_MULTIPLIER`) -- tune it if paragraphs are
   merging together (lower it) or splitting apart (raise it) for a
