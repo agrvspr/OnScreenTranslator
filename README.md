@@ -14,6 +14,8 @@ environment with an older version first, e.g.:
 ```
 py -3.12 -m venv venv
 .\venv\Scripts\Activate.ps1
+ctrl shift p 
+python interpretor venv
 ```
 
 Then, with the venv active:

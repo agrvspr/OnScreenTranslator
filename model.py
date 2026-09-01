@@ -287,31 +287,63 @@ class TranslationModel:
         return "korean", True
 
     def _detect_language(self, img_np, on_loading=None):
-        """Run one cheap OCR pass with a lightweight reader, read the
-        script, and map it to a concrete language key. Chinese defaults to
-        Simplified (script alone can't tell Simplified from Traditional --
-        the dropdown is the manual override for Traditional)."""
-        # Use whichever reader is already loaded for a cheap first pass;
-        # if none loaded yet, load Korean (arbitrary) to bootstrap. Any
-        # CJK-capable reader detects Hangul/Kana/Han code points fine even
-        # if it's not the "right" language for full recognition.
-        if self.reader_cache:
-            probe_code = next(iter(self.reader_cache))
-        else:
-            probe_code = LANGUAGES["korean"][0]
-        reader = self.get_reader(probe_code, on_loading)
+        """Detect the language by running EACH candidate language's OCR
+        reader once on the captured frame and picking whichever produces
+        the most confident, non-empty recognition results.
 
-        results = _run_ocr(reader, img_np)
-        sample = " ".join(text for _, text, _ in results)
-        script = detect_language_from_text(sample)
+        This costs more than a single OCR pass (up to 3x, one per
+        candidate), but it only happens ONCE per session -- auto-detect
+        locks after the first successful detection -- so this is a
+        one-time startup cost, not a per-frame tax.
 
-        if script == "korean":
-            return "korean"
+        We can't just OCR once with an arbitrary "bootstrap" reader and
+        inspect the Unicode script of its output, because each PaddleOCR
+        language model's recognition vocabulary is limited to that
+        language's own script: a Korean-tuned recognizer literally cannot
+        output Chinese Hanzi characters, since it was never trained on
+        them. Probing Chinese text with a Korean reader doesn't produce
+        "some Chinese characters to inspect" -- it produces empty or
+        garbage output, with nothing usable to detect a script from. That
+        was the bug in the previous approach: it silently failed and fell
+        back to Korean regardless of what was actually on screen."""
+        candidates = ["korean", "chinese_simplified", "japanese"]
+        best_key = None
+        best_score = -1.0
+        best_sample = ""
+
+        if on_loading:
+            on_loading("Detecting language (trying Korean/Chinese/Japanese)...")
+
+        for key in candidates:
+            ocr_code, _translate_code = LANGUAGES[key]
+            reader = self.get_reader(ocr_code, on_loading)
+            results = _run_ocr(reader, img_np)
+
+            texts = [text for _bbox, text, _conf in results if text.strip()]
+            scores = [conf for _bbox, _text, conf in results if conf is not None]
+            if not texts:
+                continue  # this reader found nothing recognizable at all
+
+            avg_score = (sum(scores) / len(scores)) if scores else 0.0
+            if avg_score > best_score:
+                best_score = avg_score
+                best_key = key
+                best_sample = " ".join(texts)
+
+        if best_key is None:
+            return None  # no reader could recognize anything this frame
+
+        # Refine using script analysis on the WINNING reader's actual
+        # output -- mainly to catch Japanese kana in a sample that
+        # otherwise scored well on the Chinese reader (Chinese and
+        # Japanese share Kanji, so the Chinese reader can sometimes "win"
+        # on confidence for Japanese text that's mostly Kanji).
+        script = detect_language_from_text(best_sample)
         if script == "japanese":
             return "japanese"
-        if script == "chinese":
-            return "chinese_simplified"
-        return None
+        if script == "korean":
+            return "korean"
+        return best_key  # trust the winning reader's own language
 
     # ------------------------------------------------------------------
     # Extraction + translation
@@ -340,9 +372,16 @@ class TranslationModel:
             self.seen_paragraphs.popitem(last=False)  # evict oldest
 
     def translate(self, text, language_key):
+        """Returns a translated string. deep_translator's GoogleTranslator
+        can return None (rather than raising) on certain edge-case inputs
+        (empty/whitespace text, some short strings) -- guard against that
+        so the caller always gets a real string to display."""
         _ocr_lang_code, translate_code = LANGUAGES[language_key]
         translator = self.get_translator(translate_code)
         try:
-            return translator.translate(text)
+            result = translator.translate(text)
         except Exception as e:
             return f"[translation error: {e}]"
+        if result is None:
+            return "[translation error: empty result from translator]"
+        return result

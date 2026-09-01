@@ -1,3 +1,9 @@
 venv/
 __pycache__/
 *.pyc
+test_images/
+test_images_hard/
+detection_results*.csv
+.vscode/
+Thumbs.db
+.DS_Store
